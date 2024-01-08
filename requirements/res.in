@@ -1,0 +1,12 @@
+scikit-learn
+jupytext
+notebook
+plotly
+kaleido
+transformers
+datasets>=2.16.0
+ipywidgets
+matplotlib
+torch
+farm-haystack[all]==1.23.0
+sentence_transformers
