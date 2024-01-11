@@ -4,12 +4,12 @@ pip install -r requirements/res.txt --no-deps
 ```
 
 # Install and launch ElasticSearch locally (for macOS)
-Source from [here](https://www.elastic.co/guide/en/elasticsearch/reference/current/docker.html)
+Source from [here](https://www.elastic.co/guide/en/elasticsearch/reference/current/docker.html). Install elasticsearch 7 to be compatible with haystack.
 
 ```bash
 docker network create elastic
 docker pull docker.elastic.co/elasticsearch/elasticsearch:8.11.3
-docker run --name es01 --net elastic -p 9200:9200 -it -m 1GB elasticsearch:8.11.3
+docker run --name es01 --net elastic -p 9200:9200 -it -m 1GB docker.elastic.co/elasticsearch/elasticsearch:8.11.3
 
 # Then copy the generated password and export
 export ELASTIC_PASSWORD="your_password"
