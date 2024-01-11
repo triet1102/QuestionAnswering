@@ -1,0 +1,473 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.16.0
+  kernelspec:
+    display_name: Python 3 (ipykernel)
+    language: python
+    name: python3
+---
+
+```{python}
+import os
+
+os.chdir("..")
+print(f"Current directory: {os.getcwd()}")
+```
+
+```{python}
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from haystack import Answer, Document, Label
+from haystack.document_stores.elasticsearch import ElasticsearchDocumentStore
+from haystack.modeling.evaluation.squad import compute_exact, compute_f1
+from haystack.nodes.reader.farm import FARMReader
+from haystack.nodes.retriever import BM25Retriever, DensePassageRetriever
+from haystack.pipelines import (
+    DocumentSearchPipeline,
+    ExtractiveQAPipeline,
+)
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer, pipeline
+
+from src.data import convert_dataset_to_dataframe, get_dataset
+from src.utility import (
+    convert_to_squad,
+    create_paragraphs,
+    evaluate_reader,
+    evaluate_retriever,
+    plot_reader_eval,
+    plot_retriever_eval,
+)
+```
+
+```{python}
+MODEL_CKPT = "deepset/minilm-uncased-squad2"
+```
+
+### Load the dataset
+
+```{python}
+# load the electronics domain of the dataset
+subjqa = get_dataset()
+print(f"Example of an answer:\n{subjqa['train']['answers'][1]}")
+```
+
+```{python}
+# get the train/validation/test dataframes
+dfs = convert_dataset_to_dataframe(subjqa)
+for split, df in dfs.items():
+    print(f"Number of questions in {split}: {df['id'].nunique()}")
+```
+
+```{python}
+# title:                  The Amazon Standard Identification Number (ASIN) associated with each product
+# question:               The question
+# answers.text:    The span of text in the review labeled by the annotator
+# answers.answer_start:   The start character index of the answer span
+# context:                The customer review
+qa_cols = ["title", "question", "answers.text", "answers.answer_start", "context"]
+sample_df = dfs["train"][qa_cols].sample(2, random_state=7)
+print(f"2 random samples from training set:\n{sample_df}")
+```
+
+```{python}
+# get a sample answer
+start_idx = sample_df["answers.answer_start"].iloc[0][0]
+end_idx = start_idx + len(sample_df["answers.text"].iloc[0][0])
+print(f"Question: {sample_df['question'].iloc[0]}")
+print(f"Answer: {sample_df['context'].iloc[0][start_idx:end_idx]}")
+```
+
+```{python}
+# get types of frequent asked questions
+counts = {}
+question_types = ["What", "How", "Is", "Does", "Do", "Was", "Where", "Why"]
+for q in question_types:
+    counts[q] = dfs["train"]["question"].str.startswith(q).value_counts()[True]
+
+# plot the types of the frequent asked questions
+pd.Series(counts).sort_values().plot.barh()
+```
+
+### Extract Answers from Text
+
+```{python}
+# tokenize example
+tokenizer = AutoTokenizer.from_pretrained(MODEL_CKPT)
+question = "How much music can this hold?"
+context = """An MP3 is about 1 MB/minute, so about 6000 hours depending on file size."""
+inputs = tokenizer(question, context, return_tensors="pt")
+print(f"Encoded question and context: {inputs}")
+print(f"Decoded question and context: {tokenizer.decode(inputs['input_ids'][0])}")
+# We see that for each QA example, the inputs take the format:
+# [CLS] question tokens [SEP] context tokens [SEP]
+```
+
+```{python}
+model = AutoModelForQuestionAnswering.from_pretrained(
+    MODEL_CKPT
+)  # model is initialized in eval mode by default
+with torch.no_grad():
+    outputs = model(**inputs)
+print(f"Outputs of inputs: {outputs}")
+```
+
+```{python}
+# get the shapes of tensors
+start_logits = outputs.start_logits
+end_logits = outputs.end_logits
+print(f"Input IDs shape: {inputs.input_ids.size()}")
+print(f"Start logits shape: {start_logits.size()}")
+print(f"End logits shape: {end_logits.size()}")
+```
+
+```{python}
+# get the question and answer
+start_idx = torch.argmax(start_logits)
+end_idx = torch.argmax(end_logits) + 1
+answer_span = inputs["input_ids"][0][start_idx:end_idx]
+answer = tokenizer.decode(answer_span)
+print(f"Question: {question}")
+print(f"Answer: {answer}")
+```
+
+```{python}
+s_scores = start_logits.detach().numpy().flatten()
+e_scores = end_logits.detach().numpy().flatten()
+tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+token_ids = range(len(tokens))
+
+fig, (ax1, ax2) = plt.subplots(nrows=2, sharex=True)
+colors = ["C0" if s != np.max(s_scores) else "C1" for s in s_scores]
+ax1.bar(x=token_ids, height=s_scores, color=colors)
+ax1.set_ylabel("Start Scores")
+colors = ["C0" if s != np.max(e_scores) else "C1" for s in e_scores]
+ax2.bar(x=token_ids, height=e_scores, color=colors)
+ax2.set_ylabel("End Scores")
+plt.xticks(token_ids, tokens, rotation="vertical")
+plt.show()
+```
+
+```{python}
+# get the question answering pipeline with transformer pipeline
+pipe = pipeline("question-answering", model=model, tokenizer=tokenizer)
+print(f"Pipe question-answering: {pipe(question=question, context=context, topk=3)}")
+```
+
+```{python}
+# try no answerable question
+print(
+    f"Pipe no answerable question-answering: {pipe(question='Why is there no data?', context=context, handle_impossible_answer=True)}"
+)
+```
+
+```{python}
+# deal with long context, we will truncate the long context into multiple
+# smaller text with `stride` tokens overlap, see https://huggingface.co/docs/transformers/main_classes/tokenizer#transformers.PreTrainedTokenizer.__call__
+example = dfs["train"].iloc[0][["question", "context"]]
+tokenized_example = tokenizer(
+    example["question"],
+    example["context"],
+    max_length=100,
+    stride=25,
+    return_overflowing_tokens=True,
+)
+```
+
+```{python}
+for idx, window in enumerate(tokenized_example["input_ids"]):
+    print(f"Window {idx} has {len(window)} tokens\n")
+
+for idx, window in enumerate(tokenized_example["input_ids"]):
+    print(f"Window {idx}: {tokenizer.decode(window)}\n")
+```
+
+### Haystack Retriever-Reader
+
+```{python}
+document_store = ElasticsearchDocumentStore(
+        return_embedding=True,
+        username="elastic",
+        ca_certs="/Users/triettran/http_ca.crt",
+        password="CIty8qFW9ondPkXa=2cr",
+        scheme="https",
+    )
+```
+
+```{python}
+for split, df in dfs.items():
+    # Exclude duplicate reviews
+    docs = [{"content": row["context"], "id": row["review_id"],
+             "meta":{"item_id": row["title"], "question_id": row["id"],
+                     "split": split}}
+        for _,row in df.drop_duplicates(subset="context").iterrows()]
+    document_store.write_documents(documents=docs, index="document")
+
+print(f"Loaded {document_store.get_document_count()} documents")
+```
+
+### Initialize the Retriever
+
+```{python}
+bm25_retriever = BM25Retriever(document_store=document_store)
+```
+
+```{python}
+item_id = "B0074BW614"
+query = "Is it good for reading?"
+retrieved_docs = bm25_retriever.retrieve(
+    query=query, top_k=3, filters={"item_id":[item_id], "split":["train"]})
+```
+
+```{python}
+print(retrieved_docs[0])
+```
+
+### Initialize the Reader
+
+```{python}
+max_seq_length, doc_stride = 384, 128
+reader = FARMReader(model_name_or_path=MODEL_CKPT, progress_bar=False,
+                    max_seq_len=max_seq_length, doc_stride=doc_stride,
+                    return_no_answer=True)
+```
+
+```{python}
+print(reader.predict_on_texts(question=question, texts=[context], top_k=1))
+```
+
+### Initialize the Retriever-Reader pipeline
+
+```{python}
+pipe = ExtractiveQAPipeline(reader=reader, retriever=bm25_retriever)
+```
+
+```{python}
+n_answers = 3
+preds = pipe.run(query=query, params={"Retriever": {"top_k": 3, "filters":{"item_id": [item_id], "split":["train"]}},
+                                      "Reader": {"top_k": n_answers}})
+
+print(f"Question: {preds['query']} \n")
+
+for idx in range(n_answers):
+    print(f"Answer {idx+1}: {preds['answers'][idx].answer}")
+    print(f"Review snippet: ...{preds['answers'][idx].context}...")
+    print("\n\n")
+```
+
+### Evaluate the Retriever
+
+```{python}
+pipe = DocumentSearchPipeline(retriever=bm25_retriever)
+```
+
+```{python}
+labels = []
+for i, row in dfs["test"].iterrows():
+    # Metadata used for filtering in the Retriever
+    meta = {"item_id": row["title"], "question_id": row["id"]}
+    # Populate labels for questions with answers
+    if len(row["answers.text"]):
+        for answer in row["answers.text"]:
+            label = Label(
+                query=row["question"], answer=Answer(answer=answer), origin="gold-label", document=Document(content=row["context"], id=row["review_id"]),
+                meta=meta, is_correct_answer=True, is_correct_document=True,
+                no_answer=False, filters={"item_id": [meta["item_id"]], "split":["test"]})
+            labels.append(label)
+    # Populate labels for questions without answers
+    else:
+        label = Label(
+            query=row["question"], answer=Answer(answer=""), origin="gold-label", document=Document(content=row["context"], id=row["review_id"]),
+            meta=meta, is_correct_answer=True, is_correct_document=True,
+            no_answer=True, filters={"item_id": [row["title"]], "split":["test"]})
+        labels.append(label)
+```
+
+```{python}
+document_store.write_labels(labels, index="label")
+
+print(f"""Loaded {document_store.get_label_count(index="label")} question-answer pairs""")
+```
+
+```{python}
+labels_agg = document_store.get_all_labels_aggregated(
+    index="label",
+    open_domain=True,
+    aggregate_by_meta=["item_id"]
+)
+print(len(labels_agg))
+```
+
+```{python}
+# We can run the pipeline with the desired top_k value like this
+eval_result = pipe.eval(
+    labels=labels_agg,
+    params={"Retriever": {"top_k": 3}},
+)
+metrics = eval_result.calculate_metrics()
+```
+
+```{python}
+print(f"Recall@3: {metrics['Retriever']['recall_single_hit']:.2f}")
+```
+
+```{python}
+eval_df = eval_result["Retriever"]
+eval_df[eval_df["query"] == "How do you like the lens?"][["query", "filters", "rank", "context", "gold_contexts", "document_id", "gold_document_ids", "gold_documents_id_match"]]
+```
+
+evaluate the BM25 retriever
+
+```{python}
+bm25_topk_df = evaluate_retriever(retriever=bm25_retriever, labels=labels_agg)
+```
+
+```{python}
+plot_retriever_eval([bm25_topk_df], ["BM25"])
+```
+
+evaluate the DensePassageRetriever retriever
+
+```{python}
+dpr_retriever = DensePassageRetriever(document_store=document_store,
+    query_embedding_model="facebook/dpr-question_encoder-single-nq-base",
+    passage_embedding_model="facebook/dpr-ctx_encoder-single-nq-base",
+    embed_title=False)
+```
+
+```{python}
+document_store.update_embeddings(retriever=dpr_retriever)
+```
+
+```{python}
+dpr_topk_df = evaluate_retriever(retriever=dpr_retriever, labels=labels_agg)
+plot_retriever_eval([bm25_topk_df, dpr_topk_df], ["BM25", "DPR"])
+```
+
+### Evaluate the Reader
+
+```{python}
+pred = "about 6000 hours"
+label = "6000 hours"
+print(f"EM: {compute_exact(label, pred)}")
+print(f"F1: {compute_f1(label, pred)}")
+```
+
+```{python}
+pred = "about 6000 dollars"
+print(f"EM: {compute_exact(label, pred)}")
+print(f"F1: {compute_f1(label, pred)}")
+```
+
+```{python}
+reader_eval = {}
+reader_eval["Fine-tune on SQuAD"] = evaluate_reader(reader=reader, labels=labels_agg)
+```
+
+```{python}
+plot_reader_eval(reader_eval)
+```
+
+### Domain adaptation
+
+
+see src/train.py for fine-tuning the reader
+
+```{python}
+fine_tuned_ckpt = "saved_models/Bert"
+reader = FARMReader(model_name_or_path=fine_tuned_ckpt, progress_bar=False,
+                    max_seq_len=max_seq_length, doc_stride=doc_stride,
+                    return_no_answer=True)
+```
+
+```{python}
+reader_eval["Fine-tune on SQuAD + SubjQA"] = evaluate_reader(reader, labels=labels_agg)
+```
+
+```{python}
+plot_reader_eval(reader_eval)
+```
+
+### Evaluate the whole Question-Answering Pipeline
+
+```{python}
+pipe = ExtractiveQAPipeline(retriever=bm25_retriever, reader=reader)
+
+# evaluate
+eval_result = pipe.eval(
+    labels=labels_agg,
+    params={}
+)
+```
+
+```{python}
+metrics = eval_result.calculate_metrics(simulated_top_k_reader=1)
+```
+
+```{python}
+# Extract metrics from reader
+reader_eval["QA Pipeline (top-1)"] = {
+    k:v for k,v in metrics["Reader"].items()
+    if k in ["exact_match", "f1"]}
+```
+
+```{python}
+# compare the pure Reader vs Extractive Question-Answering pipeline
+plot_reader_eval({"Reader": reader_eval["Fine-tune on SQuAD + SubjQA"],
+                  "QA pipeline (top-1)": reader_eval["QA Pipeline (top-1)"]})
+```
+
+### Retrievel Augmented Generation (RAG)
+
+```{python}
+from haystack.nodes import PromptNode, PromptTemplate, AnswerParser
+from haystack import Pipeline
+from getpass import getpass
+```
+
+```{python}
+HF_TOKEN = getpass("HuggingFace token")
+```
+
+```{python}
+qa_template = PromptTemplate(prompt="""Synthesize a comprehensive answer from the following topk most relevant paragraphs and the given question.
+                             Provide a clear and concise response that summarizes the key points and information presented in the paragraphs.
+                             Your answer should be in your own words and be no longer than 50 words.
+                             \n\n Paragraphs: {join(documents)} \n\n Question: {query} \n\n Answer:""",
+                             output_parser=AnswerParser(),)
+```
+
+```{python}
+prompt_node = PromptNode(model_name_or_path="mistralai/Mistral-7B-Instruct-v0.1",
+                         api_key=HF_TOKEN,
+                         default_prompt_template=qa_template,
+                         max_length=800,
+                         model_kwargs={"model_max_length":8000})
+```
+
+```{python}
+rag_pipeline = Pipeline()
+rag_pipeline.add_node(component=bm25_retriever, name="retriever", inputs=["Query"])
+rag_pipeline.add_node(component=prompt_node, name="prompt_node", inputs=["retriever"])
+```
+
+```{python}
+res = rag_pipeline.run(
+    query="What is the main drawback?",
+    params={"retriever": {"top_k":5, "filters":{"item_id": ["B0074BW614"]}}},
+)
+```
+
+```{python}
+res["answers"][0].answer
+```
+
+```{python}
+
+```
