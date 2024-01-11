@@ -21,3 +21,6 @@ dataset
 
 # should commit only Rmd file
 *.ipynb
+
+# ignore the fine-tuned model
+saved_models
