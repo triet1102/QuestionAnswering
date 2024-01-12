@@ -195,7 +195,7 @@ document_store = ElasticsearchDocumentStore(
         return_embedding=True,
         username="elastic",
         ca_certs="/Users/triettran/http_ca.crt",
-        password="CIty8qFW9ondPkXa=2cr",
+        password="your_elastic_password",
         scheme="https",
     )
 ```
